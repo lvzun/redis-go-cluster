@@ -15,13 +15,13 @@
 package redis
 
 import (
-    "errors"
-    "log"
-    "fmt"
-    "time"
-    "sync"
-    "strings"
-    "strconv"
+	"errors"
+	"fmt"
+	"log"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
 )
 
 // Options is used to initialize a new redis cluster.
@@ -32,8 +32,10 @@ type Options struct {
     ReadTimeout	    time.Duration   // Read timeout
     WriteTimeout    time.Duration   // Write timeout
 
-    KeepAlive	    int		    // Maximum keep alive connecion in each node
-    AliveTime	    time.Duration   // Keep alive timeout
+	KeepAlive int           // Maximum keep alive connecion in each node
+	AliveTime time.Duration // Keep alive timeout
+	Password  string
+	OutNodes  map[string]string
 }
 
 // Cluster is a redis client that manage connections to redis nodes, 
@@ -55,7 +57,9 @@ type Cluster struct {
 
     rwLock	    sync.RWMutex
 
-    closed	    bool
+	closed   bool
+	password string
+	outNodes map[string]string //公网ip节点
 }
 
 type updateMesg struct {
@@ -65,34 +69,37 @@ type updateMesg struct {
 
 // NewCluster create a new redis cluster client with specified options.
 func NewCluster(options *Options) (*Cluster, error) {
-    cluster := &Cluster{
-	nodes: make(map[string]*redisNode),
-	connTimeout: options.ConnTimeout,
-	readTimeout: options.ReadTimeout,
-	writeTimeout: options.WriteTimeout,
-	keepAlive: options.KeepAlive,
-	aliveTime: options.AliveTime,
-	updateList: make(chan updateMesg),
-    }
-
-    for i := range options.StartNodes {
-	node := &redisNode{
-	    address: options.StartNodes[i],
-	    connTimeout: options.ConnTimeout,
-	    readTimeout: options.ReadTimeout,
-	    writeTimeout: options.WriteTimeout,
-	    keepAlive: options.KeepAlive,
-	    aliveTime: options.AliveTime,
+	cluster := &Cluster{
+		nodes:        make(map[string]*redisNode),
+		connTimeout:  options.ConnTimeout,
+		readTimeout:  options.ReadTimeout,
+		writeTimeout: options.WriteTimeout,
+		keepAlive:    options.KeepAlive,
+		aliveTime:    options.AliveTime,
+		password:     options.Password,
+		outNodes:     options.OutNodes,
+		updateList:   make(chan updateMesg),
 	}
 
-	err := cluster.update(node)
-	if err != nil {
-	    continue
-	} else {
-	    go cluster.handleUpdate()
-	    return cluster, nil
+	for i := range options.StartNodes {
+		node := &redisNode{
+			address:       options.StartNodes[i],
+			connTimeout:   options.ConnTimeout,
+			readTimeout:   options.ReadTimeout,
+			writeTimeout:  options.WriteTimeout,
+			keepAlive:     options.KeepAlive,
+			aliveTime:     options.AliveTime,
+			outMapAddress: options.OutNodes,
+		}
+		err := cluster.update(node)
+		if err != nil {
+			fmt.Println(err)
+			continue
+		} else {
+			go cluster.handleUpdate()
+			return cluster, nil
+		}
 	}
-    }
 
     return nil, fmt.Errorf("NewCluster: no valid node in %v", options.StartNodes)
 }
@@ -123,28 +130,76 @@ func (cluster *Cluster) Do(cmd string, args ...interface{}) (interface{}, error)
 	return cluster.multiGet(cmd, args...)
     }
 
-    node, err := cluster.getNodeByKey(args[0])
-    if err != nil {
-	return nil, fmt.Errorf("Do: %v", err)
-    }
+	node, err := cluster.getNodeByKey(args[0])
+	if err != nil {
+		return nil, fmt.Errorf("Do: %v", err)
+	}
+Retry:
+	reply, err := node.do(cmd, args...)
+	tryNum := 0
+	if strings.Contains(fmt.Sprintf("%s", reply), "NOAUTH Authentication required") {
+		if _, err1 := node.do("AUTH", cluster.password); err1 != nil { //tongcheng_ticket_zzl "86JSYoKiYo1Gtq1GtqJCQkSWtKS.JTQzFVMmRxVUp"
+			fmt.Println("redis cluster ", err1)
+		}
+		if tryNum < 2 {
+			tryNum++
+			goto Retry
+		}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("Do1: %v", err)
+	}
 
-    reply, err := node.do(cmd, args...)
-    if err != nil {
-	return nil, fmt.Errorf("Do: %v", err)
-    }
+	resp := checkReply(reply)
 
-    resp := checkReply(reply)
+	switch resp {
+	case kRespOK, kRespError:
+		return reply, nil
+	case kRespMove:
+		return cluster.handleMove(node, reply.(redisError).Error(), cmd, args)
+	case kRespAsk:
+		return cluster.handleAsk(node, reply.(redisError).Error(), cmd, args)
+	case kRespConnTimeout:
+		return cluster.handleConnTimeout(node, cmd, args)
+	}
 
-    switch(resp) {
-    case kRespOK, kRespError:
-	return reply, nil
-    case kRespMove:
-	return cluster.handleMove(node, reply.(redisError).Error(), cmd, args)
-    case kRespAsk:
-	return cluster.handleAsk(node, reply.(redisError).Error(), cmd, args)
-    case kRespConnTimeout:
-	return cluster.handleConnTimeout(node, cmd, args)
-    }
+	panic("unreachable")
+}
+
+func (cluster *Cluster) Do2(cmd string, args ...interface{}) (interface{}, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("Do: no key found in args")
+	}
+
+	if cmd == "MSET" || cmd == "MSETNX" {
+		return cluster.multiSet(cmd, args...)
+	}
+
+	if cmd == "MGET" {
+		return cluster.multiGet(cmd, args...)
+	}
+
+	node, err := cluster.getNodeByKey(args[0])
+	if err != nil {
+		return nil, fmt.Errorf("Do: %v", err)
+	}
+	reply, err := node.do(cmd, args...)
+	if err != nil {
+		return nil, fmt.Errorf("Do: %v", err)
+	}
+	fmt.Println(reply)
+	resp := checkReply(reply)
+
+	switch resp {
+	case kRespOK, kRespError:
+		return reply, nil
+	case kRespMove:
+		return cluster.handleMove(node, reply.(redisError).Error(), cmd, args)
+	case kRespAsk:
+		return cluster.handleAsk(node, reply.(redisError).Error(), cmd, args)
+	case kRespConnTimeout:
+		return cluster.handleConnTimeout(node, cmd, args)
+	}
 
     panic("unreachable")
 }
@@ -312,12 +367,15 @@ func checkReply(reply interface{}) int {
 }
 
 func (cluster *Cluster) update(node *redisNode) error {
-    info, err := Values(node.do("CLUSTER", "SLOTS"))
-    if err != nil {
-	return err
-    }
+	if _, err1 := node.do("AUTH", cluster.password); err1 != nil {
+		fmt.Println(err1)
+	}
+	info, err := Values(node.do("CLUSTER", "SLOTS"))
+	if err != nil {
+		return err
+	}
 
-    errFormat := fmt.Errorf("update: %s invalid response", node.address)
+	errFormat := fmt.Errorf("update: %s invalid response", node.address)
 
     var nslots int
     slots := make(map[string][]uint16)
@@ -376,18 +434,19 @@ func (cluster *Cluster) update(node *redisNode) error {
     t := time.Now()
     cluster.updateTime = t
 
-    for addr, slot := range slots {
-	node, ok := cluster.nodes[addr]
-	if !ok {
-	    node = &redisNode {
-		address: addr,
-		connTimeout: cluster.connTimeout,
-		readTimeout: cluster.readTimeout,
-		writeTimeout: cluster.writeTimeout,
-		keepAlive: cluster.keepAlive,
-		aliveTime: cluster.aliveTime,
-	    }
-	}
+	for addr, slot := range slots {
+		node, ok := cluster.nodes[addr]
+		if !ok {
+			node = &redisNode{
+				address:       addr,
+				connTimeout:   cluster.connTimeout,
+				readTimeout:   cluster.readTimeout,
+				writeTimeout:  cluster.writeTimeout,
+				keepAlive:     cluster.keepAlive,
+				aliveTime:     cluster.aliveTime,
+				outMapAddress: cluster.outNodes,
+			}
+		}
 
 	n := len(slot)
 	for i := 0; i < n - 1; i += 2 {
@@ -408,9 +467,9 @@ func (cluster *Cluster) update(node *redisNode) error {
 	if node.updateTime != t {
 	    node.shutdown()
 
-	    delete(cluster.nodes, addr)
+			delete(cluster.nodes, addr)
+		}
 	}
-    }
 
     return nil
 }

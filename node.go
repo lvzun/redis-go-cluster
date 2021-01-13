@@ -16,14 +16,15 @@
 package redis
 
 import (
-    "fmt"
-    "net"
-    "sync"
-    "time"
-    "bufio"
-    "errors"
-    "strconv"
-    "container/list"
+	"bufio"
+	"container/list"
+	"errors"
+	"fmt"
+	"net"
+	"strconv"
+
+	"sync"
+	"time"
 )
 
 type redisConn struct {
@@ -61,7 +62,8 @@ type redisNode struct {
 
     updateTime	    time.Time
 
-    closed	    bool
+	closed        bool
+	outMapAddress map[string]string
 }
 
 func (node *redisNode) getConn() (*redisConn, error) {
@@ -72,28 +74,33 @@ func (node *redisNode) getConn() (*redisConn, error) {
 	return nil, fmt.Errorf("getConn: connection has been closed")
     }
 
-    // remove stale connections
-    if node.connTimeout > 0 {
-	for {
-	    elem := node.conns.Back()
-	    if elem == nil {
-		break
-	    }
-	    conn := elem.Value.(*redisConn)
-	    if conn.t.Add(node.aliveTime).After(time.Now()) {
-		break
-	    }
-	    node.conns.Remove(elem)
+	// remove stale connections
+	if node.connTimeout > 0 {
+		for {
+			elem := node.conns.Back()
+			if elem == nil {
+				break
+			}
+			conn := elem.Value.(*redisConn)
+			if conn.t.Add(node.aliveTime).After(time.Now()) {
+				break
+			}
+			node.conns.Remove(elem)
+		}
 	}
-    }
-
-    if node.conns.Len() <= 0 {
-	node.mutex.Unlock()
-
-	c, err := net.DialTimeout("tcp", node.address, node.connTimeout)
-	if err != nil {
-	    return nil, err
-	}
+	if node.conns.Len() <= 0 {
+		node.mutex.Unlock()
+		address := node.outMapAddress[node.address]
+		if address == "" {
+			address = node.address
+		}
+		//fmt.Println("node.address", node.address)
+		//fmt.Println("node.outMapAddress", node.outMapAddress)
+		c, err := net.DialTimeout("tcp", address, node.connTimeout)
+		//fmt.Println(address, node.connTimeout, err)
+		if err != nil {
+			return nil, err
+		}
 
 	conn := &redisConn{
 	    c: c,
@@ -218,7 +225,7 @@ func (node *redisNode) do(cmd string, args ...interface{}) (interface{}, error) 
 
     node.releaseConn(conn)
 
-    return reply, err
+	return reply, err
 }
 
 func (conn *redisConn) writeLen(prefix byte, n int) error {
